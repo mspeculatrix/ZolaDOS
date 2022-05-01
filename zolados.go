@@ -1,5 +1,7 @@
 // Zolados
 // Version: 0.2
+// Implements:
+//   - File upload (with no filename selection)
 
 package main
 
