@@ -1,7 +1,7 @@
 // Zolados
-// Version: 0.2
+// Version: 0.3
 // Implements:
-//   - File upload (with no filename selection)
+//   - File upload (with filename selection)
 
 package main
 
@@ -26,6 +26,8 @@ const (
 	timeoutDelay   = time.Millisecond * 500 // 100 works
 	loadFileOpcode = 128
 	saveFileOpcode = 8
+
+	maxFilenameLen = 15
 
 	rescodeErr        = 255
 	rescodeMatchState = 1
@@ -201,11 +203,34 @@ func main() {
 				responseCode := RespOK // default/success
 				switch opcode {
 				case ZD_OPCODE_LOAD:
+					verbosePrintln("--- FILENAME ---")
+
+					// *******************************************************
+					//filename := make([]int, 0, maxFilenameLen)
+					fileName = ""
+					// Wait for CA low
+					resperr := waitForState(clActSig, ACTIVE)
+					fnloop := true
+					for fnloop {
+						resperr = waitForState(clRdySig, ACTIVE)
+						chrcode := readDataPortValue()
+						fileName += string(chrcode)
+						serverReadyStrobe()
+						caState := clActSig.Read()
+						if caState == rpio.High {
+							fnloop = false
+						}
+					}
+					// SHOULD DO SOME CHECKS HERE
+					fileName += ".BIN"
+					verbosePrintln("- Filename:", fileName)
+					// *******************************************************
+
 					verbosePrintln("--- SERVER RESPONSE ---")
 					readErr := RespOK
 					fileOkay := true
 					resultStr := "OK"
-					resperr := waitForState(clActSig, NOT_ACTIVE)
+					resperr = waitForState(clActSig, NOT_ACTIVE)
 					if resperr == rescodeTimeout {
 						readErr = resperr
 						resultStr = "Timed out waiting for CA to be inactive"
@@ -213,7 +238,6 @@ func main() {
 						setDataPortDirection(DIR_OUTPUT)
 						svrActSig.Write(ACTIVE)
 						resperr = waitForState(clRdySig, ACTIVE)
-						// **** TIMING OUT HERE ****
 						if resperr == rescodeTimeout {
 							readErr = resperr
 							resultStr = "TO waiting for CR to become active"

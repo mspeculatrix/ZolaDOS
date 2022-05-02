@@ -16,6 +16,7 @@ zolados
 .gitignore
 zd_files
 _*
+.DS*
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
