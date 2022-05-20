@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
@@ -21,13 +22,16 @@ import (
 )
 
 const (
-	version        = "0.2"
+	version        = "0.4"
 	strobeDelay    = time.Microsecond * 500 // delay strobing signals
 	timeoutDelay   = time.Millisecond * 500 // 100 works
 	loadFileOpcode = 128
 	saveFileOpcode = 8
 
+	stringReadDelay = 100
+
 	maxFilenameLen = 15
+	filesPerLine   = 4
 
 	rescodeErr        = 255
 	rescodeMatchState = 1
@@ -35,36 +39,45 @@ const (
 	rescodeTerm       = 4
 	fileReadErr       = 64
 
+	dataEndCode = 255
+
 	ZD_OPCODE_LOAD = 8
+	ZD_OPCODE_LS   = 16
 	ZD_OPCODE_SAVE = 128
 	DIR_INPUT      = 0
 	DIR_OUTPUT     = 1
 	ACTIVE         = rpio.Low
 	NOT_ACTIVE     = rpio.High
+	ONLINE         = rpio.High
+	OFFLINE        = rpio.Low
 
 	RespOK          = 0
 	RespErrOpenFile = 11
-	RespErrUnknown  = 12
+	RespErrLSfail   = 12
+	FnameSendErr    = 13 // ??????????
 )
 
 var (
-	fileDir   = "/home/pi/zd_files"
-	fileName  = "zd.bin"
-	clActSig  = rpio.Pin(5)  // PB0
-	clRdySig  = rpio.Pin(6)  // PB1
-	svrRdySig = rpio.Pin(19) // PB4
-	svrActSig = rpio.Pin(16) // PB5
-	d0        = rpio.Pin(4)  // PA0..PA7
-	d1        = rpio.Pin(17)
-	d2        = rpio.Pin(18)
-	d3        = rpio.Pin(27)
-	d4        = rpio.Pin(22)
-	d5        = rpio.Pin(23)
-	d6        = rpio.Pin(24)
-	d7        = rpio.Pin(25)
-	dataPort  = []rpio.Pin{d0, d1, d2, d3, d4, d5, d6, d7}
-	dataDirs  = []string{"INPUT", "OUTPUT"}
-	verbose   = true
+	fileDir     = "/home/pi/zd_files"
+	fileName    = "ZD"
+	clActSig    = rpio.Pin(5)  // PB0
+	clRdySig    = rpio.Pin(6)  // PB1
+	clOnlineSig = rpio.Pin(12) // PB3
+	svrRdySig   = rpio.Pin(19) // PB4
+	svrActSig   = rpio.Pin(16) // PB5
+	d0          = rpio.Pin(4)  // PA0..PA7
+	d1          = rpio.Pin(17)
+	d2          = rpio.Pin(18)
+	d3          = rpio.Pin(27)
+	d4          = rpio.Pin(22)
+	d5          = rpio.Pin(23)
+	d6          = rpio.Pin(24)
+	d7          = rpio.Pin(25)
+	dataPort    = []rpio.Pin{d0, d1, d2, d3, d4, d5, d6, d7}
+	//dataDirs    = []string{"INPUT", "OUTPUT"}
+	verbose     = false
+	startTime   time.Time
+	elapsedTime time.Duration
 )
 
 func verbosePrintln(msgs ...string) {
@@ -77,11 +90,11 @@ func verbosePrintln(msgs ...string) {
 }
 
 func printLine() {
-	verbosePrintln(strings.Repeat("-", 60))
+	verbosePrintln(strings.Repeat("-", 50))
 }
 
 func setDataPortDirection(portdir int) {
-	verbosePrintln("Setting data port to", dataDirs[portdir])
+	//verbosePrintln("- setting data port to", dataDirs[portdir])
 	for i := 0; i < 8; i++ {
 		if portdir == DIR_INPUT {
 			dataPort[i].Input()
@@ -93,36 +106,24 @@ func setDataPortDirection(portdir int) {
 
 func readDataPortValue() int {
 	val := 0
-	//binary := ""
 	for i := 0; i < 8; i++ {
 		databit := dataPort[i].Read()
 		if databit == rpio.High {
-			//		binary = "1" + binary
 			val = val | (1 << i)
-		} // else {
-		//		binary = "0" + binary
-		//}
+		}
 	}
-	//verbosePrintln("-", binary)
-	//verbosePrintln("- Port value read:", strconv.Itoa(val))
 	return val
 }
 
 func setDataPortValue(val int) {
-	// checkByte := 0
-	// binStr := ""
 	for i := 0; i < 8; i++ {
 		bit := val & (1 << i)
 		if bit == 0 {
-			// binStr = "0" + binStr
 			dataPort[i].Write(rpio.Low)
 		} else {
-			// binStr = "1" + binStr
-			// checkByte = checkByte | (1 << i)
 			dataPort[i].Write(rpio.High)
 		}
 	}
-	// fmt.Printf("%s - Data port value set to: 0x%X - checkbyte: 0x%X\n", binStr, val, checkByte)
 }
 
 func waitForState(signal rpio.Pin, state rpio.State) int {
@@ -140,6 +141,71 @@ func waitForState(signal rpio.Pin, state rpio.State) int {
 		}
 	}
 	return result
+}
+
+func getString() (string, bool, string) {
+	gStr := ""
+	errFlag := false
+	errStr := ""
+	//waitForState(clRdySig, NOT_ACTIVE)
+	resperr := waitForState(clActSig, ACTIVE) // Wait for CA low
+	if resperr == rescodeTimeout {
+		errFlag = true
+		errStr = "TO waiting for CA in getString() setup"
+	} else {
+		strloop := true
+		for strloop {
+			resperr = waitForState(clRdySig, ACTIVE)
+			if resperr == rescodeTimeout {
+				errFlag = true
+				errStr = "TO waiting for CR in getString() loop"
+			} else {
+				chrcode := readDataPortValue()
+				if chrcode > 64 && chrcode < 91 {
+					gStr += string(rune(chrcode))
+					gStr = strings.TrimSpace(gStr)
+				}
+				//			fmt.Println(chrcode)
+				serverReadyStrobe()
+				time.Sleep(time.Microsecond * stringReadDelay)
+				caState := clActSig.Read()
+				if caState == rpio.High {
+					strloop = false
+				}
+
+			}
+		}
+	}
+	return gStr, errFlag, errStr
+}
+
+func checkClientOnlineState(prevState rpio.State) (rpio.State, bool) {
+	changed := false
+	state := clOnlineSig.Read()
+	if state != prevState {
+		changed = true
+	}
+	return state, changed
+}
+
+func sendByte(byteVal int) (int, string) {
+	setDataPortValue(byteVal)
+	//time.Sleep(time.Millisecond * 2)
+	sendErr := 0
+	resultStr := ""
+	serverReadyStrobe()
+	resp1 := waitForState(clRdySig, ACTIVE)
+	if resp1 == rescodeTimeout {
+		sendErr = resp1
+		resultStr = "TO waiting for CR to be active in sendbyte"
+	} else {
+		resp2 := waitForState(clRdySig, NOT_ACTIVE)
+		if resp2 == rescodeTimeout {
+			sendErr = resp2
+			resultStr = "TO waiting for CR to be inactive in sendbytye"
+		}
+	}
+	return sendErr, resultStr
 }
 
 func serverReadyStrobe() {
@@ -171,6 +237,7 @@ func main() {
 	setDataPortDirection(DIR_INPUT)
 	clActSig.Input()
 	clRdySig.Input()
+	clOnlineSig.Input()
 	svrRdySig.Output()
 	svrActSig.Output()
 	svrRdySig.PullUp()
@@ -181,147 +248,201 @@ func main() {
 	standbyLoop := true
 	//serverReadyStrobe()
 	//reader := bufio.NewReader(os.Stdin)
-	verbosePrintln("Main loop")
+	clientOnline := OFFLINE
+	changed := false
+	clientOnlineLastState := OFFLINE
 	printLine()
-	verbosePrintln("Waiting for initial CA...")
+	verbosePrintln("Waiting for initial request...")
 	for standbyLoop {
-		activeState := clActSig.Read() // polling for an /INIT signal from Z64
-		if activeState == ACTIVE {
-			// --- INITIATE ---
-			// The Z64 has initiated a process. We'll want to stay in this
-			// block until it is complete.
-			verbosePrintln("--- INITIATE ---")
-			verbosePrintln("+ CA active")
-			result := waitForState(clRdySig, ACTIVE)
-			switch result {
-			case rescodeMatchState:
-				verbosePrintln("+ Received CR - reading code")
-				// At this stage, we're expecting to pick up a code from the
-				// Z64 indicating what kind of operation it wants to perform.
-				opcode := readDataPortValue()
-				serverReadyStrobe()
-				responseCode := RespOK // default/success
-				switch opcode {
-				case ZD_OPCODE_LOAD:
-					verbosePrintln("--- FILENAME ---")
-
-					// *******************************************************
-					//filename := make([]int, 0, maxFilenameLen)
-					fileName = ""
-					// Wait for CA low
-					resperr := waitForState(clActSig, ACTIVE)
-					fnloop := true
-					for fnloop {
-						resperr = waitForState(clRdySig, ACTIVE)
-						chrcode := readDataPortValue()
-						fileName += string(chrcode)
-						serverReadyStrobe()
-						caState := clActSig.Read()
-						if caState == rpio.High {
-							fnloop = false
-						}
-					}
-					// SHOULD DO SOME CHECKS HERE
-					fileName += ".BIN"
-					verbosePrintln("- Filename:", fileName)
-					// *******************************************************
-
-					verbosePrintln("--- SERVER RESPONSE ---")
-					readErr := RespOK
-					fileOkay := true
-					resultStr := "OK"
-					resperr = waitForState(clActSig, NOT_ACTIVE)
-					if resperr == rescodeTimeout {
-						readErr = resperr
-						resultStr = "Timed out waiting for CA to be inactive"
-					} else {
-						setDataPortDirection(DIR_OUTPUT)
-						svrActSig.Write(ACTIVE)
-						resperr = waitForState(clRdySig, ACTIVE)
-						if resperr == rescodeTimeout {
-							readErr = resperr
-							resultStr = "TO waiting for CR to become active"
-						} else {
-							filepathname := filepath.Join(fileDir, fileName)
-							verbosePrintln("+ Loading file:", filepathname)
-							fh, ferr := os.Open(filepathname)
-							if ferr != nil {
-								verbosePrintln(ferr.Error())
-								responseCode = RespErrOpenFile
-								fileOkay = false
-								resultStr = "Error opening file"
-							}
-							defer fh.Close()
-							// Send response code
-							verbosePrintln("+ Sending response code:", fmt.Sprint(responseCode))
-							setDataPortValue(responseCode)
-							serverReadyStrobe()
-							if fileOkay {
-								verbosePrintln("--- DATA TRANSFER ---")
-								loadLoop := true
-								bufferedReader := bufio.NewReader(fh)
-								verbosePrintln("+ Loading...")
-								/** ---- LOADING LOOP ------------------- */
-								for loadLoop {
-									dataByte, berr := bufferedReader.ReadByte()
-									if berr != nil {
-										if berr == io.EOF {
-											svrActSig.Write(NOT_ACTIVE)
-										} else if berr != io.EOF {
-											verbosePrintln(berr.Error())
-											readErr = fileReadErr
-											resultStr = "Cannot read file"
-										}
-										loadLoop = false
-									} else {
-										//fmt.Printf("byte: 0x%X\n", dataByte)
-										setDataPortValue(int(dataByte))
-										//time.Sleep(time.Millisecond * 2)
-										serverReadyStrobe()
-										resp1 := waitForState(clRdySig, ACTIVE)
-										if resp1 == rescodeTimeout {
-											readErr = resp1
-											resultStr = "Timed out waiting for CR to be active"
-											loadLoop = false
-										} else {
-											resp2 := waitForState(clRdySig, NOT_ACTIVE)
-											if resp2 == rescodeTimeout {
-												readErr = resp2
-												resultStr = "Timed out waiting for CR to be inactive"
-												loadLoop = false
-											}
-										}
-									}
-								} // -- end loading loop ---------------------------
-								svrActSig.Write(NOT_ACTIVE)
-							}
-						}
-					}
-					if readErr > 0 {
-						verbosePrintln("*** ERROR:", strconv.Itoa(readErr), resultStr, "***")
-					} else {
-						verbosePrintln("+ Loading complete:", resultStr)
-					}
-				case ZD_OPCODE_SAVE:
-					verbosePrintln("+ Saving")
-				default:
-					verbosePrintln("*** Unknown opcode ***")
-				}
-				svrRdySig.Write(NOT_ACTIVE)
-				svrActSig.Write(NOT_ACTIVE)
-			case rescodeTerm:
-				verbosePrintln("Job done")
-			case rescodeTimeout:
-				fmt.Println("*** Timed out ***")
-			default:
-				fmt.Println("Well, this isn't right")
+		clientOnline, changed = checkClientOnlineState(clientOnlineLastState)
+		if changed {
+			clientOnlineLastState = clientOnline
+			if clientOnline == ONLINE {
+				verbosePrintln("--- ONLINE ---")
+			} else {
+				verbosePrintln("--- OFFLINE ---")
 			}
-			printLine()
-			setDataPortDirection(DIR_INPUT)
-			time.Sleep(time.Second)
-			// fmt.Print("Press <RETURN> to continue...")
-			// key, _ := reader.ReadString('\n')
-			verbosePrintln("Waiting for next CA...")
 		}
-	}
+		if clientOnline == ONLINE {
+			activeState := clActSig.Read() // polling for an /INIT signal from Z64
+			if activeState == ACTIVE {
+				// --- INITIATE ---
+				// The Z64 has initiated a process.
+				verbosePrintln("+ Request received")
+				//verbosePrintln("- CA active")
+				result := waitForState(clRdySig, ACTIVE)
+				switch result {
+				case rescodeMatchState:
+					//verbosePrintln("- Received CR - reading code")
+					// At this stage, we're expecting to pick up a code from the
+					// Z64 indicating what kind of operation it wants to perform.
+					opcode := readDataPortValue()
+					serverReadyStrobe()
+					responseCode := RespOK // default/success
+					verbosePrintln("- code read:", strconv.Itoa(opcode))
+					switch opcode {
+					case ZD_OPCODE_LOAD:
+						// *********************************************************
+						// ***** LOAD                                            ***
+						// *********************************************************
+						//verbosePrintln("+ FILENAME")
+						okayToContinue := true
+						// caStateErr := waitForState(clActSig, NOT_ACTIVE)
+						// verbosePrintln("caStateErr:", fmt.Sprint(caStateErr))
+						// if caStateErr == rescodeTimeout {
+						// 	verbosePrintln("timed out waiting for CA to go high again")
+						// }
+						fName, errFlag, errStr := getString()
+						if !errFlag {
+							fileName = fName + ".BIN"
+							verbosePrintln("- Filename:", fileName)
+						} else {
+							verbosePrintln(errStr)
+							okayToContinue = false
+						}
+						if okayToContinue {
+							//verbosePrintln("+ SERVER RESPONSE")
+							byteCount := 0
+							readErr := RespOK
+							fileOkay := true
+							resultStr := "OK"
+							resperr := waitForState(clActSig, NOT_ACTIVE)
+							if resperr == rescodeTimeout {
+								readErr = resperr
+								resultStr = "Timed out waiting for CA to be inactive"
+							} else {
+								setDataPortDirection(DIR_OUTPUT)
+								svrActSig.Write(ACTIVE)
+								resperr = waitForState(clRdySig, ACTIVE)
+								if resperr == rescodeTimeout {
+									readErr = resperr
+									resultStr = "TO waiting for CR to become active"
+								} else {
+									filepathname := filepath.Join(fileDir, fileName)
+									verbosePrintln("- Loading file:", filepathname)
+									fh, ferr := os.Open(filepathname)
+									if ferr != nil {
+										verbosePrintln(ferr.Error())
+										responseCode = RespErrOpenFile
+										fileOkay = false
+										resultStr = "Error opening file"
+									}
+									defer fh.Close()
+									// Send response code
+									verbosePrintln("- Sending response code:", fmt.Sprint(responseCode))
+									setDataPortValue(responseCode)
+									serverReadyStrobe()
+									svrActSig.Write(NOT_ACTIVE)
+									if fileOkay {
+										//verbosePrintln("+ DATA TRANSFER")
+										loadLoop := true
+										bufferedReader := bufio.NewReader(fh)
+										verbosePrintln("- Loading...")
+										startTime = time.Now()
+										svrActSig.Write(ACTIVE)
+										/** ---- LOADING LOOP ------------------- */
+										for loadLoop {
+											dataByte, berr := bufferedReader.ReadByte()
+											if berr != nil {
+												if berr == io.EOF {
+													svrActSig.Write(NOT_ACTIVE)
+												} else if berr != io.EOF {
+													verbosePrintln(berr.Error())
+													readErr = fileReadErr
+													resultStr = "Cannot read file"
+												}
+												loadLoop = false
+											} else {
+												byteCount++
+												//fmt.Printf("0x%X ", dataByte)
+												readErr, _ = sendByte(int(dataByte))
+												if readErr > 0 {
+													loadLoop = false
+													resultStr = "Error sending data byte"
+												}
+											}
+										} // -- end loading loop ---------------------------
+										svrActSig.Write(NOT_ACTIVE)
+										elapsedTime = time.Since(startTime)
+									}
+								}
+							}
+							if readErr > 0 {
+								verbosePrintln("*** ERROR:", strconv.Itoa(readErr), resultStr, "***")
+							} else {
+								elapsedTimeStr := ""
+								if byteCount > 0 {
+									elapsedTimeStr = fmt.Sprintf("- %.3gs", elapsedTime.Seconds())
+								}
+								verbosePrintln("- Done:", resultStr, "-", strconv.Itoa(byteCount), "bytes", elapsedTimeStr)
+							}
+						}
+					case ZD_OPCODE_LS:
+						// *********************************************************
+						// ***** LS                                              ***
+						// *********************************************************
+						result := 0
+						verbosePrintln("- List storage")
+						svrRdySig.Write(NOT_ACTIVE) // Just to be sure
+						svrActSig.Write(ACTIVE)
+						files, lserr := ioutil.ReadDir(fileDir)
+						if lserr != nil {
+							result = RespErrLSfail
+							verbosePrintln("Failed to list files locally", strconv.Itoa(result))
+						}
+						setDataPortDirection(DIR_OUTPUT)
+						for _, file := range files {
+							shortName := strings.Split(file.Name(), ".")[0]
+							fnLen := len([]rune(shortName))
+							fileErr := false
+							if fnLen < maxFilenameLen {
+								for i := 0; i < fnLen; i++ {
+									byteErr, _ := sendByte(int(shortName[i]))
+									if byteErr > 0 {
+										fileErr = true
+									}
+								}
+								if !fileErr {
+									nulErr, _ := sendByte(0)
+									if nulErr > 0 {
+										fileErr = true
+									}
+								}
+							}
+							if fileErr {
+								result = FnameSendErr
+								break
+							}
+						}
+						// All files sent
+						endErr, endStr := sendByte(dataEndCode)
+						if endErr != 0 {
+							verbosePrintln(endStr)
+						}
+						// HERE WE SHOULD SEND THE RESULT TO THE PI AS A
+						// CONFIRMATION
+						svrActSig.Write(NOT_ACTIVE)
+					case ZD_OPCODE_SAVE:
+						verbosePrintln("+ Saving")
+					default:
+						verbosePrintln("*** Unknown opcode ***")
+					}
+					svrRdySig.Write(NOT_ACTIVE)
+					svrActSig.Write(NOT_ACTIVE)
+				case rescodeTerm:
+					verbosePrintln("Job done")
+				case rescodeTimeout:
+					fmt.Println("*** Timed out ***")
+				default:
+					fmt.Println("Well, this isn't right")
+				}
+				setDataPortDirection(DIR_INPUT)
+				time.Sleep(time.Millisecond * 100)
+				// fmt.Print("Press <RETURN> to continue...")
+				// key, _ := reader.ReadString('\n')
+				verbosePrintln("- waiting for next request...")
+				printLine()
+			}
+		}
+	} // standbyLoop
 }
