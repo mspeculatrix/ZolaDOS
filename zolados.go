@@ -22,13 +22,14 @@ import (
 )
 
 const (
-	version        = "0.4"
-	strobeDelay    = time.Microsecond * 500 // delay strobing signals
-	timeoutDelay   = time.Millisecond * 500 // 100 works
-	loadFileOpcode = 128
-	saveFileOpcode = 8
+	version         = "0.4"
+	strobeDelay     = time.Microsecond * 500 // delay strobing signals
+	timeoutDelay    = time.Millisecond * 500 // 100 works
+	loadSettleDelay = time.Millisecond * 100 // give load ops a breather
+	loadFileOpcode  = 128
+	saveFileOpcode  = 8
 
-	stringReadDelay = 100
+	stringReadDelay = 500
 
 	maxFilenameLen = 15
 	filesPerLine   = 4
@@ -74,6 +75,9 @@ var (
 	d6          = rpio.Pin(24)
 	d7          = rpio.Pin(25)
 	dataPort    = []rpio.Pin{d0, d1, d2, d3, d4, d5, d6, d7}
+	irq         = rpio.Pin(7)
+	intsel      = rpio.Pin(20)
+	led         = rpio.Pin(8)
 	//dataDirs    = []string{"INPUT", "OUTPUT"}
 	verbose     = false
 	startTime   time.Time
@@ -234,6 +238,12 @@ func main() {
 
 	verbosePrintln(" ")
 	verbosePrintln("ZolaDOS - version", version)
+	irq.Output()
+	irq.Write(rpio.High)
+	intsel.Output()
+	intsel.Write(rpio.Low)
+	led.Output()
+	led.Write(rpio.Low)
 	setDataPortDirection(DIR_INPUT)
 	clActSig.Input()
 	clRdySig.Input()
@@ -333,6 +343,7 @@ func main() {
 									setDataPortValue(responseCode)
 									serverReadyStrobe()
 									svrActSig.Write(NOT_ACTIVE)
+									time.Sleep(loadSettleDelay)
 									if fileOkay {
 										//verbosePrintln("+ DATA TRANSFER")
 										loadLoop := true
@@ -385,6 +396,7 @@ func main() {
 						verbosePrintln("- List storage")
 						svrRdySig.Write(NOT_ACTIVE) // Just to be sure
 						svrActSig.Write(ACTIVE)
+						//time.Sleep(time.Microsecond * 1000)
 						files, lserr := ioutil.ReadDir(fileDir)
 						if lserr != nil {
 							result = RespErrLSfail
