@@ -1,7 +1,8 @@
 // Zolados
-// Version: 0.3
-// Implements:
-//   - File upload (with filename selection)
+// Implements Z64 commands:
+//   - LOAD
+//   - LS
+//   - SAVE
 
 package main
 
@@ -22,10 +23,11 @@ import (
 )
 
 const (
-	version         = "0.4"
-	strobeDelay     = time.Microsecond * 500 // delay strobing signals
-	timeoutDelay    = time.Millisecond * 100 // 100 works
-	loadSettleDelay = time.Millisecond * 1   // give load ops a breather
+	version           = "1.0"
+	strobeDelay       = time.Microsecond * 200 // delay strobing signals
+	timeoutDelay      = time.Millisecond * 100 // 100ms works
+	loadResponseDelay = time.Millisecond * 1   // 1ms works, try smaller
+	saveResponseDelay = time.Microsecond * 100
 
 	stringReadDelay = 500
 
@@ -36,20 +38,25 @@ const (
 	rescodeMatchState = 1
 	rescodeTimeout    = 2
 	rescodeTerm       = 4
-	fileReadErr       = 64
-	fileOpenErr       = 128
+
+	fileExistsErr   = 20 // Match with error codes in Z64 code
+	fileNotFoundErr = 11
+	fileReadErr     = 6
+	fileOpenErr     = 21
 
 	dataEndCode = 255
 
-	ZD_OPCODE_LOAD = 2
-	ZD_OPCODE_LS   = 8
-	ZD_OPCODE_SAVE = 16
-	DIR_INPUT      = 0
-	DIR_OUTPUT     = 1
-	ACTIVE         = rpio.Low
-	NOT_ACTIVE     = rpio.High
-	ONLINE         = rpio.High
-	OFFLINE        = rpio.Low
+	ZD_OPCODE_LOAD     = 2
+	ZD_OPCODE_LS       = 8
+	ZD_OPCODE_SAVE_CRT = 16 // Save - create (no overwrite)
+	ZD_OPCODE_SAVE_OVR = 17 // Save - overwrite
+	ZD_OPCODE_SAVE_APP = 18 // Save - append
+	DIR_INPUT          = 0
+	DIR_OUTPUT         = 1
+	ACTIVE             = rpio.Low
+	NOT_ACTIVE         = rpio.High
+	ONLINE             = rpio.High
+	OFFLINE            = rpio.Low
 
 	RespOK          = 0
 	RespErrOpenFile = 11
@@ -150,7 +157,6 @@ func getString() (string, bool, string) {
 	gStr := ""
 	errFlag := false
 	errStr := ""
-	//waitForState(clRdySig, NOT_ACTIVE)
 	resperr := waitForState(clActSig, ACTIVE) // Wait for CA low
 	if resperr == rescodeTimeout {
 		errFlag = true
@@ -168,14 +174,12 @@ func getString() (string, bool, string) {
 					gStr += string(rune(chrcode))
 					gStr = strings.TrimSpace(gStr)
 				}
-				//			fmt.Println(chrcode)
 				serverReadyStrobe()
 				time.Sleep(time.Microsecond * stringReadDelay)
 				caState := clActSig.Read()
 				if caState == rpio.High {
 					strloop = false
 				}
-
 			}
 		}
 	}
@@ -191,9 +195,17 @@ func checkClientOnlineState(prevState rpio.State) (rpio.State, bool) {
 	return state, changed
 }
 
+func processDone(bytesCounted int, resStr string) {
+	elapsedTimeStr := ""
+	if bytesCounted > 0 {
+		elapsedTimeStr = fmt.Sprintf("- %.3gs", elapsedTime.Seconds())
+	}
+	verbosePrintln("- Done:", resStr, "-", strconv.Itoa(bytesCounted), "bytes", elapsedTimeStr)
+
+}
+
 func sendByte(byteVal int) (int, string) {
 	setDataPortValue(byteVal)
-	//time.Sleep(time.Millisecond * 2)
 	sendErr := 0
 	resultStr := ""
 	serverReadyStrobe()
@@ -211,7 +223,7 @@ func sendByte(byteVal int) (int, string) {
 	return sendErr, resultStr
 }
 
-func sendResponseCode(code int) (int, string) {
+func sendResponseCode(code int, respdelay time.Duration) (int, string) {
 	verbosePrintln("- Sending response code:", fmt.Sprint(code))
 	resultStr := "OK"
 	resperr := waitForState(clActSig, NOT_ACTIVE)
@@ -222,11 +234,11 @@ func sendResponseCode(code int) (int, string) {
 		if resperr == rescodeMatchState {
 			setDataPortValue(code)
 			serverReadyStrobe()
-			svrActSig.Write(NOT_ACTIVE)
-			time.Sleep(loadSettleDelay)
 		} else {
 			resultStr = "Timeout waiting for CR to be active"
 		}
+		svrActSig.Write(NOT_ACTIVE)
+		time.Sleep(respdelay)
 	} else {
 		resultStr = "Timeout waiting for CA to become inactive"
 	}
@@ -246,6 +258,9 @@ func serverReadyStrobe() {
 //
 //}
 
+/* ==========================================================================
+   -----  MAIN                                                          -----
+   ========================================================================== */
 func main() {
 	gpioErr := rpio.Open()
 	if gpioErr != nil {
@@ -284,6 +299,7 @@ func main() {
 	clientOnlineLastState := OFFLINE
 	printLine()
 	verbosePrintln("Waiting for initial request...")
+	//----- MAIN LOOP ----------------------------------------------------------
 	for standbyLoop {
 		clientOnline, changed = checkClientOnlineState(clientOnlineLastState)
 		if changed {
@@ -300,11 +316,9 @@ func main() {
 				// --- INITIATE ---
 				// The Z64 has initiated a process.
 				verbosePrintln("+ Request received")
-				//verbosePrintln("- CA active")
 				result := waitForState(clRdySig, ACTIVE)
 				switch result {
 				case rescodeMatchState:
-					//verbosePrintln("- Received CR - reading code")
 					// At this stage, we're expecting to pick up a code from the
 					// Z64 indicating what kind of operation it wants to perform.
 					opcode := readDataPortValue()
@@ -313,16 +327,11 @@ func main() {
 					verbosePrintln("- code read:", strconv.Itoa(opcode))
 					switch opcode {
 					case ZD_OPCODE_LOAD:
-						// *********************************************************
-						// ***** LOAD                                            ***
-						// *********************************************************
+						// *****************************************************
+						// ***** LOAD                                        ***
+						// *****************************************************
 						//verbosePrintln("+ FILENAME")
 						okayToContinue := true
-						// caStateErr := waitForState(clActSig, NOT_ACTIVE)
-						// verbosePrintln("caStateErr:", fmt.Sprint(caStateErr))
-						// if caStateErr == rescodeTimeout {
-						// 	verbosePrintln("timed out waiting for CA to go high again")
-						// }
 						fName, errFlag, errStr := getString()
 						if !errFlag {
 							fileName = fName + ".BIN"
@@ -349,7 +358,7 @@ func main() {
 							}
 							defer fh.Close()
 							//time.Sleep(time.Millisecond * 500)
-							resperr, respmsg := sendResponseCode(responseCode)
+							resperr, respmsg := sendResponseCode(responseCode, loadResponseDelay)
 							if fileOkay && resperr == rescodeMatchState {
 								svrActSig.Write(ACTIVE)
 								loadLoop := true
@@ -377,7 +386,7 @@ func main() {
 											//resultStr = "Error sending data byte"
 										}
 									}
-								} // -- end loading loop ---------------------------
+								} // -- end loading loop -----------------------
 								svrActSig.Write(NOT_ACTIVE)
 								elapsedTime = time.Since(startTime)
 							} else {
@@ -386,11 +395,7 @@ func main() {
 							if readErr > 0 {
 								verbosePrintln("*** ERROR:", strconv.Itoa(readErr), resultStr, "***")
 							} else {
-								elapsedTimeStr := ""
-								if byteCount > 0 {
-									elapsedTimeStr = fmt.Sprintf("- %.3gs", elapsedTime.Seconds())
-								}
-								verbosePrintln("- Done:", resultStr, "-", strconv.Itoa(byteCount), "bytes", elapsedTimeStr)
+								processDone(byteCount, resultStr)
 							}
 						}
 					case ZD_OPCODE_LS:
@@ -439,69 +444,114 @@ func main() {
 						// HERE WE SHOULD SEND THE RESULT TO THE PI AS A
 						// CONFIRMATION
 						svrActSig.Write(NOT_ACTIVE)
-					case ZD_OPCODE_SAVE:
-						// *********************************************************
-						// ***** SAVE                                            ***
-						// *********************************************************
+					case ZD_OPCODE_SAVE_CRT, ZD_OPCODE_SAVE_OVR, ZD_OPCODE_SAVE_APP:
+						// *****************************************************
+						// ***** SAVE                                        ***
+						// *****************************************************
 						okayToContinue := true
+						resultStr := "OK"
 						verbosePrintln("+ Saving")
+						saveMode := 0
+						switch opcode {
+						case ZD_OPCODE_SAVE_CRT:
+							saveMode = os.O_WRONLY | os.O_CREATE
+						case ZD_OPCODE_SAVE_OVR:
+							saveMode = os.O_WRONLY | os.O_TRUNC | os.O_CREATE
+						case ZD_OPCODE_SAVE_APP:
+							saveMode = os.O_WRONLY | os.O_APPEND | os.O_CREATE
+						default:
+							saveMode = os.O_WRONLY | os.O_CREATE
+						}
 						// ----- GET FILENAME ----------------------------------
 						fName, errFlag, errStr := getString()
 						if !errFlag {
 							fileName = fName + ".BIN"
 							verbosePrintln("- Filename:", fileName)
 						} else {
-							verbosePrintln(errStr)
+							resultStr = errStr
 							okayToContinue = false
 						}
 						if okayToContinue {
 							fileErr := 0
 							filepathname := filepath.Join(fileDir, fileName)
 							verbosePrintln("- Saving to file:", filepathname)
-							fh, err := os.Create(filepathname)
-							if err != nil {
-								fileErr = fileOpenErr
-								verbosePrintln("- Could not create file:", filepathname)
-							}
-							defer fh.Close()
-							// ----- SEND RESPONSE----------------------------------
 							writeOK := true
-							resperr, respmsg := sendResponseCode(fileErr)
-							if resperr != rescodeMatchState {
-								writeOK = false
-								verbosePrintln(respmsg)
+							if opcode == ZD_OPCODE_SAVE_CRT {
+								// Check if file already exists
+								_, exerr := os.Stat(filepathname)
+								if exerr == nil {
+									writeOK = false
+									fileErr = fileExistsErr
+									verbosePrintln("! File exists!")
+								}
 							}
-							// ----- RECEIVE DATA-----------------------------------
-							setDataPortDirection(DIR_INPUT)
-							filebyte := make([]byte, 1)
-							resperr = waitForState(clActSig, ACTIVE)
-							if resperr == rescodeMatchState {
-								for writeOK {
-									// --- loop ---
-									resperr = waitForState(clRdySig, ACTIVE)
-									if resperr == rescodeMatchState {
-										filebyte[0] = byte(readDataPortValue())
-										resperr = waitForState(clRdySig, NOT_ACTIVE)
+							if fileErr == 0 {
+								fh, err := os.OpenFile(filepathname, saveMode, 0644)
+								if err != nil {
+									fileErr = fileOpenErr
+									verbosePrintln("- Could not create file:", filepathname)
+									resultStr = "File open error"
+									writeOK = false
+								}
+								defer fh.Close()
+								// ----- SEND RESPONSE------------------------------
+								resperr, respmsg := sendResponseCode(fileErr, saveResponseDelay)
+								if resperr != rescodeMatchState {
+									writeOK = false
+									verbosePrintln(respmsg)
+								}
+								// ----- RECEIVE DATA-------------------------------
+								setDataPortDirection(DIR_INPUT)
+								filebyte := make([]byte, 1)
+								byteCount := 0
+								saveErr := false
+								//resperr = waitForState(clActSig, NOT_ACTIVE)
+								//if resperr == rescodeMatchState {
+								resperr = waitForState(clActSig, ACTIVE)
+								if resperr == rescodeMatchState {
+									startTime = time.Now()
+									for writeOK {
+										// --- loop ---
+										resperr = waitForState(clRdySig, ACTIVE)
 										if resperr == rescodeMatchState {
-											_, wrerr := fh.Write(filebyte)
-											if wrerr != nil {
-												writeOK = false
-											} else {
-												verbosePrintln("oops. CR didn't go inactive")
-											}
+											filebyte[0] = byte(readDataPortValue())
 											serverReadyStrobe()
-											caState := clActSig.Read()
-											if caState == NOT_ACTIVE {
-												writeOK = false
+											byteCount++
+											resperr = waitForState(clRdySig, NOT_ACTIVE)
+											if resperr == rescodeMatchState {
+												_, wrerr := fh.Write(filebyte)
+												if wrerr != nil {
+													writeOK = false
+													resultStr = "Filewrite failed"
+													saveErr = true
+												}
+											} else {
+												resultStr = "Got tired of waiting for CR to be active"
+												saveErr = true
 											}
-										} else {
-											verbosePrintln("Got tired of waiting for CR active")
+										}
+										caState := clActSig.Read()
+										if caState == NOT_ACTIVE {
+											writeOK = false
 										}
 									}
+									if !saveErr {
+										elapsedTime = time.Since(startTime)
+										processDone(byteCount, resultStr)
+									} else {
+										verbosePrintln(resultStr)
+									}
+								} else {
+									verbosePrintln("! Got bored waiting for CA to be active")
 								}
 							} else {
-								verbosePrintln("Timed out waiting for CA active")
+								sendResponseCode(fileErr, saveResponseDelay)
+								svrRdySig.Write(NOT_ACTIVE)
+								svrActSig.Write(NOT_ACTIVE)
 							}
+							//} else {
+							//	verbosePrintln("! Not waiting for CA to be inactive any more")
+							//}
 						}
 					default:
 						verbosePrintln("*** Unknown opcode ***")
