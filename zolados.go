@@ -452,6 +452,7 @@ func main() {
 						resultStr := "OK"
 						verbosePrintln("+ Saving")
 						saveMode := 0
+						inBuf := make([]byte, 0) // input buffer
 						switch opcode {
 						case ZD_OPCODE_SAVE_CRT:
 							saveMode = os.O_WRONLY | os.O_CREATE
@@ -502,7 +503,7 @@ func main() {
 								}
 								// ----- RECEIVE DATA-------------------------------
 								setDataPortDirection(DIR_INPUT)
-								filebyte := make([]byte, 1)
+								//filebyte := make([]byte, 1)
 								byteCount := 0
 								saveErr := false
 								//resperr = waitForState(clActSig, NOT_ACTIVE)
@@ -514,17 +515,11 @@ func main() {
 										// --- loop ---
 										resperr = waitForState(clRdySig, ACTIVE)
 										if resperr == rescodeMatchState {
-											filebyte[0] = byte(readDataPortValue())
-											serverReadyStrobe()
+											inBuf = append(inBuf, byte(readDataPortValue()))
 											byteCount++
 											resperr = waitForState(clRdySig, NOT_ACTIVE)
 											if resperr == rescodeMatchState {
-												_, wrerr := fh.Write(filebyte)
-												if wrerr != nil {
-													writeOK = false
-													resultStr = "Filewrite failed"
-													saveErr = true
-												}
+												serverReadyStrobe()
 											} else {
 												resultStr = "Got tired of waiting for CR to be active"
 												saveErr = true
@@ -534,6 +529,10 @@ func main() {
 										if caState == NOT_ACTIVE {
 											writeOK = false
 										}
+									}
+									_, wrerr := fh.Write(inBuf)
+									if wrerr != nil {
+										saveErr = true
 									}
 									if !saveErr {
 										elapsedTime = time.Since(startTime)
